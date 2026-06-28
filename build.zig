@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 // Run: `zig build`
 // Requirements:
@@ -22,7 +21,17 @@ pub fn build(b: *std.Build) !void {
     const install_minichlink_lib = b.addInstallArtifact(minichlink_lib, .{});
     build_lib.dependOn(&install_minichlink_lib.step);
 
-    const minichlink_ocd = try buildMinichlinkOcd(b, target, optimize, minichlink_lib);
+    // Shared translate_c step for the C bindings.
+    const c_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const minichlink_dep = b.dependency("ch32fun", .{});
+    c_translate.addIncludePath(minichlink_dep.path("minichlink"));
+    c_translate.addIncludePath(b.path("src"));
+
+    const minichlink_ocd = try buildMinichlinkOcd(b, target, optimize, minichlink_lib, c_translate);
 
     const run_step = b.step("run", "Run the minichlink-ocd");
     const ocd_run = b.addRunArtifact(minichlink_ocd);
@@ -35,6 +44,9 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
             .root_source_file = b.path("src/main.zig"),
+            .imports = &.{
+                .{ .name = "c", .module = c_translate.createModule() },
+            },
         }),
         .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
     });
@@ -54,7 +66,7 @@ fn buildMinichlink(
 
     const minichlink_dep = b.dependency("ch32fun", .{});
     const minichlink = try createMinichlink(b, minichlink_dep, kind, target, optimize);
-    minichlink.linkLibrary(libusb);
+    minichlink.root_module.linkLibrary(libusb);
 
     return minichlink;
 }
@@ -81,12 +93,12 @@ fn createMinichlink(
     if (kind == .lib) {
         exe.linkage = .static;
         exe.root_module.addCMacro("MINICHLINK_AS_LIBRARY", "1");
-        exe.installHeader(root_path.path(b, "minichlink.h"), "minichlink.h");
+        exe.installHeader(dep.path("minichlink/minichlink.h"), "minichlink.h");
     }
 
-    exe.linkLibC();
-    exe.addIncludePath(root_path);
-    exe.addCSourceFiles(.{
+    exe.root_module.link_libc = true;
+    exe.root_module.addIncludePath(root_path);
+    exe.root_module.addCSourceFiles(.{
         .root = root_path,
         .files = &.{
             "minichlink.c",
@@ -97,6 +109,9 @@ fn createMinichlink(
             "serial_dev.c",
             "pgm-b003fun.c",
             "minichgdb.c",
+            "ch5xx.c",
+            "chips.c",
+            "pgm-wch-isp.c",
         },
     });
     exe.root_module.addCMacro("MINICHLINK", "1");
@@ -107,18 +122,18 @@ fn createMinichlink(
     switch (target.result.os.tag) {
         .macos => {
             exe.root_module.addCMacro("__MACOSX__", "1");
-            exe.linkFramework("CoreFoundation");
-            exe.linkFramework("IOKit");
+            exe.root_module.linkFramework("CoreFoundation", .{});
+            exe.root_module.linkFramework("IOKit", .{});
         },
         .linux, .netbsd, .openbsd => {
-            const rules = b.addInstallBinFile(try root_path.join(b.allocator, "99-minichlink.rules"), "99-minichlink.rules");
+            const rules = b.addInstallBinFile(dep.path("minichlink/99-minichlink.rules"), "99-minichlink.rules");
             exe.step.dependOn(&rules.step);
         },
         .windows => {
             exe.root_module.addCMacro("_WIN32_WINNT", "0x0600");
-            exe.addLibraryPath(dep.path("minichlink"));
-            exe.linkSystemLibrary("setupapi");
-            exe.linkSystemLibrary("ws2_32");
+            exe.root_module.addLibraryPath(dep.path("minichlink"));
+            exe.root_module.linkSystemLibrary("setupapi", .{});
+            exe.root_module.linkSystemLibrary("ws2_32", .{});
         },
         else => {},
     }
@@ -159,7 +174,6 @@ fn createLibusb(
     const lib = std.Build.Step.Compile.create(b, .{
         .name = "usb",
         .version = .{ .major = 1, .minor = 0, .patch = 27 },
-
         .kind = .lib,
         .linkage = .static,
         .root_module = b.createModule(.{
@@ -170,10 +184,10 @@ fn createLibusb(
         }),
     });
     lib.installHeader(dep.path("libusb/libusb.h"), "libusb.h");
-    lib.linkLibC();
-    lib.addIncludePath(dep.path("libusb"));
-    lib.addConfigHeader(config_header);
-    lib.addCSourceFiles(.{
+    lib.root_module.link_libc = true;
+    lib.root_module.addIncludePath(dep.path("libusb"));
+    lib.root_module.addConfigHeader(config_header);
+    lib.root_module.addCSourceFiles(.{
         .root = dep.path("libusb"),
         .files = &.{
             "core.c",
@@ -187,16 +201,16 @@ fn createLibusb(
 
     switch (target.result.os.tag) {
         .macos => {
-            lib.addIncludePath(dep.path("Xcode"));
+            lib.root_module.addIncludePath(dep.path("Xcode"));
         },
         .windows => {
-            lib.addIncludePath(dep.path("msvc"));
+            lib.root_module.addIncludePath(dep.path("msvc"));
         },
         else => {},
     }
 
     if (is_posix) {
-        lib.addCSourceFiles(.{
+        lib.root_module.addCSourceFiles(.{
             .root = dep.path("libusb/os"),
             .files = &.{
                 "events_posix.c",
@@ -204,7 +218,7 @@ fn createLibusb(
             },
         });
     } else {
-        lib.addCSourceFiles(.{
+        lib.root_module.addCSourceFiles(.{
             .root = dep.path("libusb/os"),
             .files = &.{
                 "events_windows.c",
@@ -213,21 +227,21 @@ fn createLibusb(
         });
     }
     if (target.result.abi.isAndroid()) {
-        lib.addIncludePath(dep.path("android"));
+        lib.root_module.addIncludePath(dep.path("android"));
     }
 
     switch (target.result.os.tag) {
         .macos => {
-            lib.addCSourceFiles(.{
+            lib.root_module.addCSourceFiles(.{
                 .root = dep.path("libusb/os"),
                 .files = &.{"darwin_usb.c"},
             });
-            lib.linkFramework("IOKit");
-            lib.linkFramework("CoreFoundation");
-            lib.linkFramework("Security");
+            lib.root_module.linkFramework("IOKit", .{});
+            lib.root_module.linkFramework("CoreFoundation", .{});
+            lib.root_module.linkFramework("Security", .{});
         },
         .linux => {
-            lib.addCSourceFiles(.{
+            lib.root_module.addCSourceFiles(.{
                 .root = dep.path("libusb/os"),
                 .files = &.{
                     "linux_usbfs.c",
@@ -235,10 +249,10 @@ fn createLibusb(
                     "linux_udev.c",
                 },
             });
-            lib.linkSystemLibrary2("udev", .{ .use_pkg_config = .no });
+            lib.root_module.linkSystemLibrary("udev", .{ .use_pkg_config = .no });
         },
         .windows => {
-            lib.addCSourceFiles(.{
+            lib.root_module.addCSourceFiles(.{
                 .root = dep.path("libusb/os"),
                 .files = &.{
                     "windows_common.c",
@@ -246,16 +260,16 @@ fn createLibusb(
                     "windows_winusb.c",
                 },
             });
-            lib.addWin32ResourceFile(.{ .file = dep.path("libusb/libusb-1.0.rc") });
+            lib.root_module.addWin32ResourceFile(.{ .file = dep.path("libusb/libusb-1.0.rc") });
         },
         .netbsd => {
-            lib.addCSourceFiles(.{
+            lib.root_module.addCSourceFiles(.{
                 .root = dep.path("libusb/os"),
                 .files = &.{"netbsd_usb.c"},
             });
         },
         .openbsd => {
-            lib.addCSourceFiles(.{
+            lib.root_module.addCSourceFiles(.{
                 .root = dep.path("libusb/os"),
                 .files = &.{"openbsd_usb.c"},
             });
@@ -273,6 +287,7 @@ fn buildMinichlinkOcd(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     minichlink_lib: *std.Build.Step.Compile,
+    c_translate: *std.Build.Step.TranslateC,
 ) !*std.Build.Step.Compile {
     const minichlink_dep = b.dependency("ch32fun", .{});
     const minichlink_root_path = minichlink_dep.path("minichlink");
@@ -285,196 +300,120 @@ fn buildMinichlinkOcd(
             .optimize = optimize,
             .sanitize_c = .off,
             .sanitize_thread = false,
+            .imports = &.{
+                .{ .name = "c", .module = c_translate.createModule() },
+            },
         }),
     });
-    ocd.linkLibrary(minichlink_lib);
+    ocd.root_module.linkLibrary(minichlink_lib);
     ocd.root_module.addAnonymousImport("build_zig_zon", .{ .root_source_file = b.path("build.zig.zon") });
 
-    const main_file_path = minichlink_dep.builder.pathFromRoot("minichlink/minichlink.c");
-    const minichlink_main_file = CopyAndPatchMinichlinkMainFile.create(
-        b,
-        main_file_path,
-        "src/minichlink-patched.c",
-    );
-    ocd.step.dependOn(&minichlink_main_file.step);
+    // Patch minichlink.c at configure time: copy the entire file and rename
+    // main() to orig_main(), so all helper functions and struct definitions
+    // are available to the patched file.
+    const dep_root = minichlink_dep.builder.root;
+    const abs_path = try dep_root.joinString(b.allocator, "minichlink/minichlink.c");
+    const patched_rel = "src/minichlink-patched.c";
+    const io = b.graph.io;
 
-    ocd.addIncludePath(minichlink_root_path);
-    ocd.addIncludePath(b.path("src"));
-    ocd.addCSourceFile(.{ .file = b.path(minichlink_main_file.dest_rel_path) });
+    {
+        const cwd = std.Io.Dir.cwd();
+        const content = try std.Io.Dir.readFileAlloc(cwd, io, abs_path, b.allocator, .unlimited);
+        defer b.allocator.free(content);
+
+        // Replace "int main(" with "int orig_main(" so the entry point is renamed.
+        // This ensures all functions and structs from minichlink.c are available.
+        const search = "int main(";
+        const replace_s = "int orig_main(";
+
+        // Count occurrences to allocate the right sized buffer.
+        var count: usize = 0;
+        {
+            var search_from: usize = 0;
+            while (std.mem.indexOf(u8, content[search_from..], search)) |pos| {
+                count += 1;
+                search_from += pos + search.len;
+            }
+        }
+
+        const new_len = content.len + count * (replace_s.len - search.len);
+        const patched = try b.allocator.alloc(u8, new_len);
+
+        // Perform replacement.
+        {
+            var src_idx: usize = 0;
+            var dst_idx: usize = 0;
+            while (std.mem.indexOf(u8, content[src_idx..], search)) |pos| {
+                @memcpy(patched[dst_idx..][0..pos], content[src_idx..][0..pos]);
+                dst_idx += pos;
+                src_idx += pos;
+                @memcpy(patched[dst_idx..][0..replace_s.len], replace_s);
+                dst_idx += replace_s.len;
+                src_idx += search.len;
+            }
+            const remaining = content.len - src_idx;
+            @memcpy(patched[dst_idx..][0..remaining], content[src_idx..]);
+        }
+
+        const dest_file = try std.Io.Dir.createFile(cwd, io, patched_rel, .{ .truncate = true });
+        defer std.Io.File.close(dest_file, io);
+
+        try std.Io.File.writeStreamingAll(dest_file, io, patched);
+    }
+
+    ocd.root_module.addIncludePath(minichlink_root_path);
+    ocd.root_module.addIncludePath(b.path("src"));
+    // Add parent directory so that "#include "../ch32fun/ch32fun.h" resolves correctly.
+    // The original minichlink.c uses this relative path, and it works when compiled
+    // from the ch32fun dependency.  Since minichlink-patched.c is in our src/ dir,
+    // we need this extra -I to help the compiler find that header.
+    ocd.root_module.addIncludePath(b.path(".."));
+    ocd.root_module.addCSourceFile(.{ .file = b.path(patched_rel) });
+
+    // Same macros as createMinichlink — minichlink-patched.c (a copy of minichlink.c)
+    // needs these to compile correctly.
+    ocd.root_module.addCMacro("MINICHLINK", "1");
+    ocd.root_module.addCMacro("CH32V003", "1");
+    ocd.root_module.addCMacro("__DELAY_TINY_DEFINED__", "1");
+    switch (target.result.os.tag) {
+        .macos => {
+            ocd.root_module.addCMacro("__MACOSX__", "1");
+        },
+        else => {},
+    }
 
     try addPaths(ocd.root_module, target);
 
     b.getInstallStep().dependOn(&b.addInstallArtifact(ocd, .{}).step);
-    b.getInstallStep().dependOn(
-        &b.addInstallFileWithDir(
-            b.addWriteFiles().add("wch-riscv.cfg", ""),
-            .{ .custom = b.pathJoin(&.{ "share", "openocd", "scripts", "board" }) },
-            "wch-riscv.cfg",
-        ).step,
-    );
+    {
+        const install_dir = try std.fs.path.join(b.allocator, &.{ "share", "openocd", "scripts", "board" });
+        b.getInstallStep().dependOn(
+            &b.addInstallFileWithDir(
+                b.addWriteFiles().add("wch-riscv.cfg", ""),
+                .{ .custom = install_dir },
+                "wch-riscv.cfg",
+            ).step,
+        );
+    }
 
     return ocd;
-}
-
-const CopyAndPatchMinichlinkMainFile = struct {
-    step: std.Build.Step,
-    source: []const u8,
-    dest_rel_path: []const u8,
-
-    pub fn create(
-        owner: *std.Build,
-        source: []const u8,
-        dest_rel_path: []const u8,
-    ) *CopyAndPatchMinichlinkMainFile {
-        const copy_file = owner.allocator.create(CopyAndPatchMinichlinkMainFile) catch @panic("OOM");
-        copy_file.* = .{
-            .step = std.Build.Step.init(.{
-                .id = .install_file,
-                .name = owner.fmt("copy and patch {s} to {s}", .{ source, dest_rel_path }),
-                .owner = owner,
-                .makeFn = make,
-            }),
-            .source = source,
-            .dest_rel_path = owner.dupePath(dest_rel_path),
-        };
-        return copy_file;
-    }
-
-    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
-        _ = options;
-        const b = step.owner;
-        const copy_file: *CopyAndPatchMinichlinkMainFile = @fieldParentPtr("step", step);
-
-        const cwd = std.fs.cwd();
-
-        const full_src_path = copy_file.source;
-
-        const src_file = std.fs.openFileAbsolute(copy_file.source, .{}) catch |err| {
-            return step.fail("unable to open file '{s}': {s}", .{
-                full_src_path, @errorName(err),
-            });
-        };
-        defer src_file.close();
-
-        const stat = try src_file.stat();
-
-        const buf = try b.allocator.alloc(u8, stat.size);
-        defer b.allocator.free(buf);
-
-        _ = try src_file.readAll(buf);
-
-        // Find start and end of the main function.
-        const main_start, const main_end = findFunction(buf, "int main(") orelse return step.fail("unable to find main function in '{s}'", .{copy_file.source});
-        const str_mem_start, const str_mem_end = findFunction(buf[main_start..], "int64_t StringToMemoryAddress(") orelse return step.fail("unable to find StringToMemoryAddress function in '{s}'", .{copy_file.source});
-
-        const dest_file = cwd.createFile(copy_file.dest_rel_path, .{ .truncate = true }) catch |err| {
-            return step.fail("unable to create file '{s}': {s}", .{
-                copy_file.dest_rel_path, @errorName(err),
-            });
-        };
-        defer dest_file.close();
-
-        // Write header.
-        try dest_file.writeAll(
-            \\#include <stdio.h>
-            \\#include <string.h>
-            \\#include <stdlib.h>
-            \\#include <getopt.h>
-            \\#include "terminalhelp.h"
-            \\#include "minichlink.h"
-            \\
-            \\#if defined(WINDOWS) || defined(WIN32) || defined(_WIN32)
-            \\extern int isatty(int);
-            \\#if !defined(_SYNCHAPI_H_) && !defined(__TINYC__)
-            \\void Sleep(uint32_t dwMilliseconds);
-            \\#endif
-            \\#else
-            \\#include <pwd.h>
-            \\#include <unistd.h>
-            \\#include <grp.h>
-            \\#endif
-            \\
-            \\static int64_t StringToMemoryAddress( const char * number ) __attribute__((used));
-            \\void PostSetupConfigureInterface( void * dev );
-            \\
-            \\int orig_main( int argc, char ** argv )
-        );
-
-        const main_start_offset = std.mem.indexOf(u8, buf[main_start..], "\n") orelse unreachable;
-        // Write the functions.
-        try dest_file.writeAll(buf[main_start + main_start_offset .. main_end]);
-        try dest_file.writeAll(buf[main_start + str_mem_start .. main_start + str_mem_end]);
-    }
-};
-
-fn findFunction(buf: []const u8, name: []const u8) ?struct { usize, usize } {
-    const func_start = std.mem.indexOf(u8, buf, name) orelse {
-        return null;
-    };
-
-    // Search for the end of the main function.
-    var maybe_brackets: ?usize = null;
-    var maybe_func_end_offset: ?usize = 0;
-    for (buf[func_start..], 0..) |c, i| {
-        const brackets = maybe_brackets orelse {
-            if (c == '{') {
-                maybe_brackets = 1;
-            }
-            continue;
-        };
-
-        if (c == '{') {
-            maybe_brackets = brackets + 1;
-        } else if (c == '}') {
-            maybe_brackets = brackets - 1;
-        }
-
-        if (brackets == 0) {
-            maybe_func_end_offset = i + 1;
-            break;
-        }
-    }
-
-    const func_end_offset = maybe_func_end_offset orelse return null;
-
-    return .{ func_start, func_start + func_end_offset };
 }
 
 pub fn addPaths(mod: *std.Build.Module, target: std.Build.ResolvedTarget) !void {
     const b = mod.owner;
 
-    const paths = try std.zig.system.NativePaths.detect(b.allocator, &target.result);
+    const paths = try std.zig.system.NativePaths.detect(b.allocator, b.graph.io, &target.result, &b.graph.environ_map);
 
     for (paths.lib_dirs.items) |item| {
-        std.fs.cwd().access(item, .{}) catch |e| switch (e) {
-            error.FileNotFound => continue,
-            else => return e,
-        };
-
         mod.addLibraryPath(.{ .cwd_relative = item });
     }
     for (paths.include_dirs.items) |item| {
-        std.fs.cwd().access(item, .{}) catch |e| switch (e) {
-            error.FileNotFound => continue,
-            else => return e,
-        };
-
         mod.addSystemIncludePath(.{ .cwd_relative = item });
     }
     for (paths.framework_dirs.items) |item| {
-        std.fs.cwd().access(item, .{}) catch |e| switch (e) {
-            error.FileNotFound => continue,
-            else => return e,
-        };
-
         mod.addSystemFrameworkPath(.{ .cwd_relative = item });
     }
     for (paths.rpaths.items) |item| {
-        std.fs.cwd().access(item, .{}) catch |e| switch (e) {
-            error.FileNotFound => continue,
-            else => return e,
-        };
-
         mod.addRPath(.{ .cwd_relative = item });
     }
 }
