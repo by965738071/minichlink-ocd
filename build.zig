@@ -154,6 +154,13 @@ fn createLibusb(
     optimize: std.builtin.OptimizeMode,
 ) !*std.Build.Step.Compile {
     const is_posix = target.result.os.tag != .windows;
+    // libusb source archives from GitHub don't include the generated
+    // version_describe.h. We provide it here with only LIBUSB_DESCRIBE;
+    // the numeric macros come from version.h / version_nano.h.
+    const version_header = b.addConfigHeader(.{ .style = .blank, .include_path = "version_describe.h" }, .{
+        .LIBUSB_DESCRIBE = "\"ac8abbae\"",
+    });
+
     const config_header = b.addConfigHeader(.{ .style = .blank }, .{
         ._GNU_SOURCE = 1,
         .DEFAULT_VISIBILITY = .@"__attribute__ ((visibility (\"default\")))",
@@ -187,6 +194,7 @@ fn createLibusb(
     lib.root_module.link_libc = true;
     lib.root_module.addIncludePath(dep.path("libusb"));
     lib.root_module.addConfigHeader(config_header);
+    lib.root_module.addConfigHeader(version_header);
     lib.root_module.addCSourceFiles(.{
         .root = dep.path("libusb"),
         .files = &.{
@@ -336,20 +344,63 @@ fn buildMinichlinkOcd(
             }
         }
 
-        const new_len = content.len + count * (replace_s.len - search.len);
+        // Also fix the include path: minichlink.c uses "#include "../ch32fun/ch32fun.h"
+        // which resolves within the ch32fun package, but our patched copy is in src/
+        // and needs to find ch32fun.h via -I flags instead.
+        const inc_search = "#include \"../ch32fun/ch32fun.h\"";
+        const inc_replace = "#include \"ch32fun.h\"";
+
+        var inc_count: usize = 0;
+        {
+            var search_from: usize = 0;
+            while (std.mem.indexOf(u8, content[search_from..], inc_search)) |pos| {
+                inc_count += 1;
+                search_from += pos + inc_search.len;
+            }
+        }
+
+        // replace_s is longer: "int main(" (10) -> "int orig_main(" (14): +4
+        // inc_replace is shorter: "#include \"../ch32fun/ch32fun.h\"" (29) -> "#include \"ch32fun.h\"" (19): -10
+        const delta_main: isize = @as(isize, @intCast(replace_s.len)) - @as(isize, @intCast(search.len));
+        const delta_inc: isize = @as(isize, @intCast(inc_replace.len)) - @as(isize, @intCast(inc_search.len));
+        const extra: isize = @as(isize, @intCast(count)) * delta_main + @as(isize, @intCast(inc_count)) * delta_inc;
+        const new_len = @as(usize, @intCast(@as(isize, @intCast(content.len)) + extra));
         const patched = try b.allocator.alloc(u8, new_len);
 
-        // Perform replacement.
+        // Perform replacements.
         {
             var src_idx: usize = 0;
             var dst_idx: usize = 0;
-            while (std.mem.indexOf(u8, content[src_idx..], search)) |pos| {
-                @memcpy(patched[dst_idx..][0..pos], content[src_idx..][0..pos]);
-                dst_idx += pos;
-                src_idx += pos;
-                @memcpy(patched[dst_idx..][0..replace_s.len], replace_s);
-                dst_idx += replace_s.len;
-                src_idx += search.len;
+
+            // Helper: replace next occurrence of any of the two search strings.
+            while (true) {
+                const main_pos = std.mem.indexOf(u8, content[src_idx..], search);
+                const inc_pos = std.mem.indexOf(u8, content[src_idx..], inc_search);
+
+                const do_main = main_pos != null;
+                const do_inc = inc_pos != null;
+
+                if (!do_main and !do_inc) break;
+
+                const use_main = if (do_main and do_inc) main_pos.? < inc_pos.? else do_main;
+
+                if (use_main) {
+                    const pos = main_pos.?;
+                    @memcpy(patched[dst_idx..][0..pos], content[src_idx..][0..pos]);
+                    dst_idx += pos;
+                    src_idx += pos;
+                    @memcpy(patched[dst_idx..][0..replace_s.len], replace_s);
+                    dst_idx += replace_s.len;
+                    src_idx += search.len;
+                } else {
+                    const pos = inc_pos.?;
+                    @memcpy(patched[dst_idx..][0..pos], content[src_idx..][0..pos]);
+                    dst_idx += pos;
+                    src_idx += pos;
+                    @memcpy(patched[dst_idx..][0..inc_replace.len], inc_replace);
+                    dst_idx += inc_replace.len;
+                    src_idx += inc_search.len;
+                }
             }
             const remaining = content.len - src_idx;
             @memcpy(patched[dst_idx..][0..remaining], content[src_idx..]);
@@ -363,11 +414,10 @@ fn buildMinichlinkOcd(
 
     ocd.root_module.addIncludePath(minichlink_root_path);
     ocd.root_module.addIncludePath(b.path("src"));
-    // Add parent directory so that "#include "../ch32fun/ch32fun.h" resolves correctly.
-    // The original minichlink.c uses this relative path, and it works when compiled
-    // from the ch32fun dependency.  Since minichlink-patched.c is in our src/ dir,
-    // we need this extra -I to help the compiler find that header.
-    ocd.root_module.addIncludePath(b.path(".."));
+    // Add include path so that the patched file can find "ch32fun.h"
+    // (the original include "#include "../ch32fun/ch32fun.h"" is rewritten
+    // to "#include "ch32fun.h"" during the patching step above).
+    ocd.root_module.addIncludePath(minichlink_dep.path("ch32fun"));
     ocd.root_module.addCSourceFile(.{ .file = b.path(patched_rel) });
 
     // Same macros as createMinichlink — minichlink-patched.c (a copy of minichlink.c)

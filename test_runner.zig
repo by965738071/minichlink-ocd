@@ -1,5 +1,6 @@
 // https://www.openmymind.net/Using-A-Custom-Test-Runner-In-Zig/
 // https://gist.github.com/karlseguin/c6bea5b35e4e8d26af6f81c22cb5d76b
+// Zig 0.17: test functions are accessible via `builtin.test_functions` (type `[]const std.lang.TestFn`).
 
 // in your build.zig, you can specify a custom test runner:
 // const tests = b.addTest(.{
@@ -23,8 +24,6 @@ const BORDER = brk: {
 
 // use in custom panic handler
 var current_test: ?[]const u8 = null;
-
-const global_io = Io.Threaded.global_single_threaded.io();
 
 pub fn main() !void {
     var mem: [8192]u8 = undefined;
@@ -160,7 +159,7 @@ const SlowTracker = struct {
             .allocator = allocator,
             .max = count,
             .slowest = slowest,
-            .timing_start = Io.Clock.Timestamp.now(global_io, .awake),
+            .timing_start = Io.Clock.Timestamp.now(Io.Threaded.global_single_threaded.io(), .awake),
         };
     }
 
@@ -174,11 +173,11 @@ const SlowTracker = struct {
     }
 
     fn startTiming(self: *SlowTracker) void {
-        self.timing_start = Io.Clock.Timestamp.now(global_io, .awake);
+        self.timing_start = Io.Clock.Timestamp.now(Io.Threaded.global_single_threaded.io(), .awake);
     }
 
     fn endTiming(self: *SlowTracker, test_name: []const u8) u64 {
-        const end = Io.Clock.Timestamp.now(global_io, .awake);
+        const end = Io.Clock.Timestamp.now(Io.Threaded.global_single_threaded.io(), .awake);
         const ns = @as(u96, @intCast(self.timing_start.durationTo(end).raw.nanoseconds));
         const ns_u64 = @as(u64, @intCast(ns));
 
