@@ -10,7 +10,6 @@
       url = "github:mitchellh/zig-overlay";
       inputs = {
         nixpkgs.follows = "nixpkgs";
-        flake-utils.follows = "flake-utils";
       };
     };
   };
@@ -24,7 +23,7 @@
       overlays = [
         (
           _final: prev: with prev; {
-            zig = inputs.zig.packages.${system}."0.15.1";
+            zig = inputs.zig.packages.${system}."master-2026-06-28"; # 0.17.0-dev.1099+7db2ef610
           }
         )
       ];
