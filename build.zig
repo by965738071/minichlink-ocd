@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 // Run: `zig build`
 // Requirements:
@@ -451,19 +452,41 @@ fn buildMinichlinkOcd(
 
 pub fn addPaths(mod: *std.Build.Module, target: std.Build.ResolvedTarget) !void {
     const b = mod.owner;
+    const graph = b.graph;
+    const io = graph.io;
 
-    const paths = try std.zig.system.NativePaths.detect(b.allocator, b.graph.io, &target.result, &b.graph.environ_map);
+    const paths = try std.zig.system.NativePaths.detect(b.allocator, io, &target.result, &b.graph.environ_map);
 
     for (paths.lib_dirs.items) |item| {
+        Io.Dir.cwd().access(io, item, .{}) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return e,
+        };
+
         mod.addLibraryPath(.{ .cwd_relative = item });
     }
     for (paths.include_dirs.items) |item| {
+        Io.Dir.cwd().access(io, item, .{}) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return e,
+        };
+
         mod.addSystemIncludePath(.{ .cwd_relative = item });
     }
     for (paths.framework_dirs.items) |item| {
+        Io.Dir.cwd().access(io, item, .{}) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return e,
+        };
+
         mod.addSystemFrameworkPath(.{ .cwd_relative = item });
     }
     for (paths.rpaths.items) |item| {
+        Io.Dir.cwd().access(io, item, .{}) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return e,
+        };
+
         mod.addRPath(.{ .cwd_relative = item });
     }
 }
