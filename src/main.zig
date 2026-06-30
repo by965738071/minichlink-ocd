@@ -1,49 +1,39 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
-const c = @cImport({
-    @cInclude("minichlink.h");
-    @cInclude("minichlink-patched.c");
-});
+const c = @import("c");
 
-pub fn main() !u8 {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    const gpa, const is_debug = switch (builtin.mode) {
-        .Debug, .ReleaseSafe => .{ debug_allocator.allocator(), true },
-        .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
-    };
-    defer if (is_debug) {
-        _ = debug_allocator.deinit();
-    };
+pub fn main(init: std.process.Init) !u8 {
+    const gpa = init.gpa;
     const allocator = gpa;
-    // var arena = std.heap.ArenaAllocator.init(gpa);
-    // defer arena.deinit();
-    // const allocator = arena.allocator();
 
-    const args = std.process.argsAlloc(allocator) catch |err| {
-        std.debug.print("Failed to allocate arguments\n", .{});
-        return err;
-    };
-    defer std.process.argsFree(allocator, args);
+    const args_src = try init.minimal.args.toSlice(init.arena.allocator());
+    var args = try std.ArrayList([:0]u8).initCapacity(allocator, args_src.len);
+    defer args.deinit(allocator);
+    for (args_src) |arg| {
+        args.appendAssumeCapacity(@constCast(arg));
+    }
 
-    const ocd_args = try OcdArgs.parse(allocator, args);
+    const ocd_args = try OcdArgs.parse(allocator, args.items);
     defer allocator.destroy(ocd_args);
 
     if (ocd_args.show_version) {
-        const version = try versionFromZon(allocator);
-        defer versionFromZonFree(allocator, version);
+        const version_str = comptime (blk: {
+            const zon = @import("build_zig_zon");
+            break :blk zon.version;
+        });
 
         var buffer: [64]u8 = undefined;
-        const stderr = std.debug.lockStderrWriter(&buffer);
-        defer std.debug.unlockStderrWriter();
+        const stderr = std.debug.lockStderr(&buffer);
+        defer std.debug.unlockStderr();
 
-        try stderr.print("Minichlink As Open On-Chip Debugger {s}\n", .{version.version});
+        var stderr_terminal = stderr.terminal();
+        try stderr_terminal.writer.print("Minichlink As Open On-Chip Debugger {s}\n", .{version_str});
         return 0;
     }
 
     var minichlink_args: std.ArrayList([*:0]u8) = .empty;
     defer minichlink_args.deinit(allocator);
-    try minichlink_args.append(allocator, args[0]);
+    try minichlink_args.append(allocator, args.items[0]);
 
     var programZ: ?[:0]u8 = null;
     if (ocd_args.program) |program| {
@@ -52,13 +42,13 @@ pub fn main() !u8 {
             errdefer allocator.free(programZ.?);
 
             // Check file exists
-            const file = std.fs.openFileAbsoluteZ(programZ.?, .{ .mode = .read_only }) catch |err| {
+            const file = std.Io.Dir.openFileAbsolute(init.io, programZ.?, .{ .mode = .read_only }) catch |err| {
                 std.log.err("Failed to open file: {s}: {}\n", .{ programZ.?, err });
                 return err;
             };
-            file.close();
+            file.close(init.io);
         } else {
-            programZ = try allocator.dupeZ(u8, program);
+            programZ = try allocator.dupeSentinel(u8, program, 0);
         }
 
         try minichlink_args.append(allocator, @constCast("-w"));
@@ -88,19 +78,19 @@ pub fn main() !u8 {
 
     if (ocd_args.echo) |echo| {
         var buffer: [64]u8 = undefined;
-        const stderr = std.debug.lockStderrWriter(&buffer);
-        defer std.debug.unlockStderrWriter();
+        const stderr = std.debug.lockStderr(&buffer);
+        defer std.debug.unlockStderr();
 
-        try stderr.writeAll(echo);
+        try stderr.file_writer.interface.writeAll(echo);
     }
 
     const argv: [][*:0]u8 = @constCast(minichlink_args.items);
     const argv_c_ptr: [*c][*c]u8 = @ptrCast(argv.ptr);
-    const code = c.orig_main(@intCast(argv.len), argv_c_ptr);
+    const code = c.orig_main(@intCast(argv.len), @ptrCast(argv_c_ptr));
     if (code != 0) {
         std.log.err("Error code: {}", .{code});
     }
-    return @truncate(@as(c_uint, @bitCast(code)));
+    return @truncate(@as(u32, @bitCast(code)));
 }
 
 const OcdArgs = struct {
@@ -253,23 +243,4 @@ fn testOcdArgsParse(expected: OcdArgs, args_raw: []const [:0]const u8) !void {
     std.log.info("expected: {}, actual: {}", .{ expected, actual });
 
     try std.testing.expectEqualDeep(expected, actual.*);
-}
-
-const Version = struct { version: []const u8 };
-
-fn versionFromZon(allocator: std.mem.Allocator) !Version {
-    const build_zig_zon = @embedFile("build_zig_zon");
-    const version = try std.zon.parse.fromSlice(
-        Version,
-        allocator,
-        build_zig_zon,
-        null,
-        .{ .ignore_unknown_fields = true },
-    );
-
-    return version;
-}
-
-fn versionFromZonFree(allocator: std.mem.Allocator, version: Version) void {
-    std.zon.parse.free(allocator, version);
 }
