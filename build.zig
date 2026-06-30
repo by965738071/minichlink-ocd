@@ -269,7 +269,9 @@ fn createLibusb(
                     "windows_winusb.c",
                 },
             });
-            lib.root_module.addWin32ResourceFile(.{ .file = dep.path("libusb/libusb-1.0.rc") });
+            // libusb-1.0.rc requires a generated version_describe.h.
+            // In the current case, we are statically linking the library, so in theory we do not need this file.
+            // lib.root_module.addWin32ResourceFile(.{ .file = dep.path("libusb/libusb-1.0.rc") });
         },
         .netbsd => {
             lib.root_module.addCSourceFiles(.{
